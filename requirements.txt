@@ -1,5 +1,4 @@
 streamlit==1.29.0
-
 numpy==1.26.2
 psycopg2-binary==2.9.9
 SQLAlchemy==2.0.23
