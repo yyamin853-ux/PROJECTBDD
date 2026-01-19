@@ -1,0 +1,9 @@
+streamlit==1.29.0
+pandas==2.1.4
+numpy==1.26.2
+psycopg2-binary==2.9.9
+SQLAlchemy==2.0.23
+plotly==5.18.0
+Faker==21.0.0
+ortools==9.8.3296
+python-dotenv==1.0.0
