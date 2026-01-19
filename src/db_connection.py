@@ -493,6 +493,18 @@ class DatabaseManager:
         query += " ORDER BY daily.nb_surveillances, p.nom"
         
         return self.execute_to_dataframe(query, params)
+    
+   from supabase import create_client
+import os
+from dotenv import load_dotenv
+
+load_dotenv()  # Load environment variables from .env
+
+SUPABASE_URL = os.getenv("https://dmphstzvszdwanimrhzg.supabase.co")
+SUPABASE_KEY = os.getenv("sb_publishable_-n8dBmeJbgymJF_Zzj4jmA_pny3GOrQ")
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 
 # Instance globale
 db = DatabaseManager()

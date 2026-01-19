@@ -11,6 +11,11 @@ from datetime import datetime, date
 import sys
 import os
 
+db_url = st.secrets["connections"]["postgresql"]["url"]
+
+# Connect to database
+conn = psycopg2.connect(db_url)
+
 # Ajouter le répertoire src au path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
