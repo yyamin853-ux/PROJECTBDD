@@ -2,6 +2,19 @@
 Gestionnaire de connexion à la base de données - VERSION CORRIGÉE
 Gère la conversion des types numpy en types Python
 """
+import os
+import psycopg2
+
+# Get database URL from environment
+DATABASE_URL = os.environ.get('DATABASE_URL')
+
+# Connect to PostgreSQL
+conn = psycopg2.connect(DATABASE_URL)
+cursor = conn.cursor()
+
+# Your queries here
+cursor.execute("SELECT * FROM your_table")
+results = cursor.fetchall()
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
