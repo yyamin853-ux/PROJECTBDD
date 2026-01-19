@@ -1,29 +1,14 @@
 """
 Gestionnaire de connexion à la base de données - VERSION CORRIGÉE
 Gère la conversion des types numpy en types Python
+Compatible avec Render PostgreSQL via DATABASE_URL
 """
 import os
-import psycopg2
-
-# Get database URL from environment
-DATABASE_URL = os.environ.get('DATABASE_URL')
-
-# Connect to PostgreSQL
-conn = psycopg2.connect(DATABASE_URL)
-cursor = conn.cursor()
-
-# Your queries here
-cursor.execute("SELECT * FROM your_table")
-results = cursor.fetchall()
-
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import pandas as pd
 from contextlib import contextmanager
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
+import urllib.parse as urlparse
 
 def convert_numpy_to_python(params):
     """Convertir les types numpy en types Python standards"""
@@ -53,13 +38,28 @@ class DatabaseManager:
     """Classe pour gérer les connexions et requêtes à la base de données"""
     
     def __init__(self):
-        self.config = {
-            'host': os.getenv('DB_HOST', 'localhost'),
-            'database': os.getenv('DB_NAME', 'num_exam_db'),
-            'user': os.getenv('DB_USER', 'postgres'),
-            'password': os.getenv('DB_PASSWORD', 'password'),
-            'port': os.getenv('DB_PORT', '5432')
-        }
+        # Priorité à DATABASE_URL de Render
+        database_url = os.environ.get('DATABASE_URL')
+        
+        if database_url:
+            # Parse l'URL PostgreSQL de Render
+            url = urlparse.urlparse(database_url)
+            self.config = {
+                'host': url.hostname,
+                'database': url.path[1:],  # Enlève le / du début
+                'user': url.username,
+                'password': url.password,
+                'port': url.port or 5432
+            }
+        else:
+            # Fallback vers variables d'environnement individuelles
+            self.config = {
+                'host': os.getenv('DB_HOST', 'localhost'),
+                'database': os.getenv('DB_NAME', 'num_exam_db'),
+                'user': os.getenv('DB_USER', 'postgres'),
+                'password': os.getenv('DB_PASSWORD', 'password'),
+                'port': os.getenv('DB_PORT', '5432')
+            }
     
     @contextmanager
     def get_connection(self):
@@ -506,17 +506,6 @@ class DatabaseManager:
         query += " ORDER BY daily.nb_surveillances, p.nom"
         
         return self.execute_to_dataframe(query, params)
-    
-   from supabase import create_client
-import os
-from dotenv import load_dotenv
-
-load_dotenv()  # Load environment variables from .env
-
-SUPABASE_URL = os.getenv("https://dmphstzvszdwanimrhzg.supabase.co")
-SUPABASE_KEY = os.getenv("sb_publishable_-n8dBmeJbgymJF_Zzj4jmA_pny3GOrQ")
-
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # Instance globale
