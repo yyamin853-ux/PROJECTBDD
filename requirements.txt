@@ -5,7 +5,7 @@ psycopg2-binary==2.9.9
 SQLAlchemy==2.0.23
 plotly==5.18.0
 Faker==21.0.0
-ortools==9.7 
+ortools==9.7.2996
 python-dotenv==1.0.0
 supabase
 --only-binary=:all:
