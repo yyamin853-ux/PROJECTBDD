@@ -13,6 +13,12 @@ import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.db_connection import db
+from src.display_utils import (
+    display_statistics_cards,
+    display_daily_distribution,
+    display_quality_score,
+    display_conflict_alert
+)
 
 st.set_page_config(
     page_title="Vue Stratégique - Num_Exam",
