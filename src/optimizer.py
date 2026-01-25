@@ -188,8 +188,15 @@ class ExamScheduleOptimizer:
                     b_day = self.model.NewBoolVar(f'bd_{module_id}_{jour}')
                     self.model.Add(vars_dict['timeslot'] >= ts_min).OnlyEnforceIf(b_day)
                     self.model.Add(vars_dict['timeslot'] <= ts_max).OnlyEnforceIf(b_day)
-                    self.model.Add(vars_dict['timeslot'] < ts_min).OnlyEnforceIf(b_day.Not()).OnlyEnforceIf(vars_dict['timeslot'] < ts_min)
-                    self.model.Add(vars_dict['timeslot'] > ts_max).OnlyEnforceIf(b_day.Not()).OnlyEnforceIf(vars_dict['timeslot'] > ts_max)
+                    
+                    b_out_low = self.model.NewBoolVar(f'ol_{module_id}_{jour}')
+                    b_out_high = self.model.NewBoolVar(f'oh_{module_id}_{jour}')
+                    self.model.Add(vars_dict['timeslot'] < ts_min).OnlyEnforceIf(b_out_low)
+                    self.model.Add(vars_dict['timeslot'] >= ts_min).OnlyEnforceIf(b_out_low.Not())
+                    self.model.Add(vars_dict['timeslot'] > ts_max).OnlyEnforceIf(b_out_high)
+                    self.model.Add(vars_dict['timeslot'] <= ts_max).OnlyEnforceIf(b_out_high.Not())
+                    
+                    self.model.AddBoolOr([b_out_low, b_out_high]).OnlyEnforceIf(b_day.Not())
                     
                     b_both = self.model.NewBoolVar(f'bb_{prof_idx}_{module_id}_{jour}')
                     self.model.AddBoolAnd([b_prof, b_day]).OnlyEnforceIf(b_both)
