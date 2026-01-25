@@ -56,17 +56,10 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # TAB 1: GÉNÉRATION AUTOMATIQUE RÉELLE
 # =====================================================
 with tab1:
-    st.markdown("### 🤖 Génération Automatique RÉELLE du Planning")
+    st.markdown("###  Génération Automatique RÉELLE du Planning")
     
     st.info("""
-    ℹ️ **Nouvel algorithme haute performance**
-    
-    Cet optimizer utilise un algorithme hybride (glouton + amélioration locale) 
-    optimisé pour traiter rapidement de grandes quantités de données.
-    
-    ✅ Traite 13,000+ étudiants
-    ✅ Génère en < 45 secondes
-    ✅ Minimise automatiquement les conflits
+    ℹ️ 
     """)
     
     col1, col2 = st.columns([2, 1])
