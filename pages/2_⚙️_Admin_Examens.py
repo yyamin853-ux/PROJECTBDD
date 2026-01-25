@@ -73,7 +73,7 @@ with tab1:
         # Paramètres de génération
         session_name = st.selectbox(
             "Session d'examens",
-            ["Semestre 1 - 2024/2025", "Semestre 2 - 2024/2025", "Rattrapage S1 - 2024/2025"],
+            ["Semestre 1 -, "Semestre 2"],
             index=0
         )
         
