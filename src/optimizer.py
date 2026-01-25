@@ -229,16 +229,19 @@ class ExamScheduleOptimizer:
                 prof_day_exams = []
                 
                 for module_id, vars_dict in self.exam_vars.items():
-                    b = self.model.NewBoolVar(f'pd_{prof_idx}_{jour}_{module_id}')
+                    b_prof = self.model.NewBoolVar(f'bp_{prof_idx}_{jour}_{module_id}')
+                    self.model.Add(vars_dict['prof'] == prof_idx).OnlyEnforceIf(b_prof)
+                    self.model.Add(vars_dict['prof'] != prof_idx).OnlyEnforceIf(b_prof.Not())
                     
-                    self.model.Add(vars_dict['prof'] == prof_idx).OnlyEnforceIf(b)
-                    self.model.Add(vars_dict['jour'] == jour).OnlyEnforceIf(b)
-                    self.model.AddBoolOr([
-                        vars_dict['prof'] != prof_idx,
-                        vars_dict['jour'] != jour
-                    ]).OnlyEnforceIf(b.Not())
+                    b_jour = self.model.NewBoolVar(f'bj_{prof_idx}_{jour}_{module_id}')
+                    self.model.Add(vars_dict['jour'] == jour).OnlyEnforceIf(b_jour)
+                    self.model.Add(vars_dict['jour'] != jour).OnlyEnforceIf(b_jour.Not())
                     
-                    prof_day_exams.append(b)
+                    b_both = self.model.NewBoolVar(f'bb_{prof_idx}_{jour}_{module_id}')
+                    self.model.AddBoolAnd([b_prof, b_jour]).OnlyEnforceIf(b_both)
+                    self.model.AddBoolOr([b_prof.Not(), b_jour.Not()]).OnlyEnforceIf(b_both.Not())
+                    
+                    prof_day_exams.append(b_both)
                 
                 self.model.Add(sum(prof_day_exams) <= 3)
         
