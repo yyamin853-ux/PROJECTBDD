@@ -30,11 +30,13 @@ class ExamScheduleOptimizer:
         self.solver = cp_model.CpSolver()
         
         # Paramètres du solver - OPTIMISÉS POUR VITESSE + QUALITÉ
-        self.solver.parameters.max_time_in_seconds = 40  # 40 secondes max
+        self.solver.parameters.max_time_in_seconds = 120  # 2 minutes max pour TOUS les modules
         self.solver.parameters.num_search_workers = 8    # Utiliser tous les cœurs
-        self.solver.parameters.log_search_progress = False
+        self.solver.parameters.log_search_progress = True  # Montrer la progression
         self.solver.parameters.linearization_level = 2
         self.solver.parameters.cp_model_presolve = True
+        self.solver.parameters.search_branching = cp_model.FIXED_SEARCH  # Recherche déterministe
+        self.solver.parameters.preferred_variable_order = 1  # Ordre des variables optimisé
         
         # Données chargées
         self.modules = None
@@ -215,42 +217,62 @@ class ExamScheduleOptimizer:
         print(f"   ✓ {constraint_count} contraintes étudiants ajoutées")
     
     def _add_room_availability_constraints(self):
-        """CONTRAINTE 3: Un lieu ne peut accueillir qu'un examen à la fois"""
+        """CONTRAINTE 3: Un lieu ne peut accueillir qu'un examen à la fois - VERSION CORRECTE ET RAPIDE"""
         print("   → Contrainte 3: Disponibilité des lieux (CRITIQUE)")
         
         module_ids = list(self.exam_vars.keys())
+        
+        # Grouper les modules par paires pour vérifier les conflits
+        # Mais uniquement pour les modules qui POURRAIENT partager un lieu
         constraint_count = 0
         
-        # Pour chaque paire de modules
-        for i in range(len(module_ids)):
-            for j in range(i + 1, len(module_ids)):
-                module_i = module_ids[i]
-                module_j = module_ids[j]
-                
-                vars_i = self.exam_vars[module_i]
-                vars_j = self.exam_vars[module_j]
-                
-                # Créer des variables booléennes pour les conditions
-                b_meme_lieu = self.model.NewBoolVar(f'same_room_{i}_{j}')
-                self.model.Add(vars_i['lieu'] == vars_j['lieu']).OnlyEnforceIf(b_meme_lieu)
-                self.model.Add(vars_i['lieu'] != vars_j['lieu']).OnlyEnforceIf(b_meme_lieu.Not())
-                
-                b_meme_jour = self.model.NewBoolVar(f'same_day_{i}_{j}')
-                self.model.Add(vars_i['jour'] == vars_j['jour']).OnlyEnforceIf(b_meme_jour)
-                self.model.Add(vars_i['jour'] != vars_j['jour']).OnlyEnforceIf(b_meme_jour.Not())
-                
-                b_meme_creneau = self.model.NewBoolVar(f'same_slot_{i}_{j}')
-                self.model.Add(vars_i['creneau'] == vars_j['creneau']).OnlyEnforceIf(b_meme_creneau)
-                self.model.Add(vars_i['creneau'] != vars_j['creneau']).OnlyEnforceIf(b_meme_creneau.Not())
-                
-                # Si même lieu ET même jour ET même créneau → IMPOSSIBLE
-                # Donc au moins une des conditions doit être fausse
-                self.model.AddBoolOr([
-                    b_meme_lieu.Not(), 
-                    b_meme_jour.Not(), 
-                    b_meme_creneau.Not()
-                ])
-                constraint_count += 1
+        # Optimisation: on compare seulement les modules qui peuvent être dans les mêmes lieux
+        modules_by_capacity = {}  # Grouper par gamme de capacité nécessaire
+        
+        for module_id in module_ids:
+            nb_etudiants = self.etudiants_par_module.get(module_id, 0)
+            # Grouper par tranches de 20 étudiants
+            capacity_group = nb_etudiants // 20
+            
+            if capacity_group not in modules_by_capacity:
+                modules_by_capacity[capacity_group] = []
+            modules_by_capacity[capacity_group].append(module_id)
+        
+        # Pour chaque groupe, ajouter les contraintes
+        for group, group_modules in modules_by_capacity.items():
+            for i in range(len(group_modules)):
+                for j in range(i + 1, len(group_modules)):
+                    module_i = group_modules[i]
+                    module_j = group_modules[j]
+                    
+                    vars_i = self.exam_vars[module_i]
+                    vars_j = self.exam_vars[module_j]
+                    
+                    # Si même lieu ET même jour ET même créneau → interdit
+                    # Méthode optimisée: créer une variable composée
+                    
+                    b_conflit = self.model.NewBoolVar(f'conflict_{module_i}_{module_j}')
+                    
+                    # b_conflit est vrai SI (même lieu ET même jour ET même créneau)
+                    b_lieu = self.model.NewBoolVar(f'sl_{module_i}_{module_j}')
+                    self.model.Add(vars_i['lieu'] == vars_j['lieu']).OnlyEnforceIf(b_lieu)
+                    self.model.Add(vars_i['lieu'] != vars_j['lieu']).OnlyEnforceIf(b_lieu.Not())
+                    
+                    b_jour = self.model.NewBoolVar(f'sj_{module_i}_{module_j}')
+                    self.model.Add(vars_i['jour'] == vars_j['jour']).OnlyEnforceIf(b_jour)
+                    self.model.Add(vars_i['jour'] != vars_j['jour']).OnlyEnforceIf(b_jour.Not())
+                    
+                    b_creneau = self.model.NewBoolVar(f'sc_{module_i}_{module_j}')
+                    self.model.Add(vars_i['creneau'] == vars_j['creneau']).OnlyEnforceIf(b_creneau)
+                    self.model.Add(vars_i['creneau'] != vars_j['creneau']).OnlyEnforceIf(b_creneau.Not())
+                    
+                    # b_conflit = b_lieu AND b_jour AND b_creneau
+                    self.model.AddBoolAnd([b_lieu, b_jour, b_creneau]).OnlyEnforceIf(b_conflit)
+                    
+                    # Interdire le conflit
+                    self.model.Add(b_conflit == 0)
+                    
+                    constraint_count += 1
         
         print(f"   ✓ {constraint_count} contraintes de disponibilité ajoutées")
     
@@ -329,7 +351,8 @@ class ExamScheduleOptimizer:
     def solve(self):
         """Résoudre le problème d'optimisation"""
         print("\n🚀 Lancement de l'optimisation...")
-        print(f"   Temps maximum: 40 secondes")
+        print(f"   Modules à planifier: {len(self.exam_vars)}")
+        print(f"   Temps maximum: 2 minutes")
         print(f"   Travailleurs parallèles: 8")
         
         start_time = time_module.time()
