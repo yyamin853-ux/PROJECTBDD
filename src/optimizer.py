@@ -3,7 +3,6 @@ import pandas as pd
 from datetime import datetime, timedelta, time
 import time as time_module
 from src.db_connection import db
-from collections import defaultdict
 
 class ExamScheduleOptimizer:
     
@@ -22,12 +21,8 @@ class ExamScheduleOptimizer:
         self.model = cp_model.CpModel()
         self.solver = cp_model.CpSolver()
         
-        self.solver.parameters.max_time_in_seconds = 35
+        self.solver.parameters.max_time_in_seconds = 30
         self.solver.parameters.num_search_workers = 8
-        self.solver.parameters.log_search_progress = False
-        self.solver.parameters.cp_model_presolve = True
-        self.solver.parameters.linearization_level = 2
-        self.solver.parameters.search_branching = cp_model.FIXED_SEARCH
         
         self.modules = None
         self.inscriptions = None
@@ -35,12 +30,11 @@ class ExamScheduleOptimizer:
         self.professeurs = None
         self.etudiants_par_module = {}
         self.module_dept = {}
-        self.prof_dept = {}
         
         self.exam_vars = {}
         
     def load_data(self):
-        print("📊 Chargement des données...")
+        print("📊 Chargement...")
         
         self.modules = db.execute_to_dataframe("""
             SELECT DISTINCT m.id, m.code, m.nom, m.formation_id, f.dept_id,
@@ -51,7 +45,7 @@ class ExamScheduleOptimizer:
             WHERE i.session_id = %s
             GROUP BY m.id, m.code, m.nom, m.formation_id, f.dept_id
             ORDER BY nb_inscrits DESC
-            LIMIT 200
+            LIMIT 150
         """, (self.session_id,))
         
         for _, module in self.modules.iterrows():
@@ -77,252 +71,178 @@ class ExamScheduleOptimizer:
         """)
         
         self.professeurs = db.execute_to_dataframe("""
-            SELECT p.id, p.nom, p.prenom, p.dept_id, p.max_surveillance_jour
+            SELECT p.id, p.nom, p.prenom, p.dept_id
             FROM professeurs p
             ORDER BY p.dept_id
         """)
-        
-        for _, prof in self.professeurs.iterrows():
-            self.prof_dept[prof['id']] = prof['dept_id']
         
         module_counts = self.inscriptions.groupby('module_id').size()
         for module_id, count in module_counts.items():
             self.etudiants_par_module[module_id] = count
         
-        print(f"✓ {len(self.modules)} modules")
-        print(f"✓ {len(self.lieux)} lieux")
-        print(f"✓ {len(self.professeurs)} professeurs")
-        print(f"✓ {len(self.inscriptions)} inscriptions")
+        print(f"✓ {len(self.modules)} modules, {len(self.lieux)} lieux, {len(self.professeurs)} profs")
     
     def create_variables(self):
-        print("\n🔧 Variables...")
+        print("🔧 Variables...")
+        
+        total_slots = self.nb_jours * len(self.creneaux)
         
         for _, module in self.modules.iterrows():
             module_id = module['id']
             
-            jour_var = self.model.NewIntVar(0, self.nb_jours - 1, f'j_{module_id}')
-            creneau_var = self.model.NewIntVar(0, len(self.creneaux) - 1, f'c_{module_id}')
-            lieu_var = self.model.NewIntVar(0, len(self.lieux) - 1, f'l_{module_id}')
-            prof_var = self.model.NewIntVar(0, len(self.professeurs) - 1, f'p_{module_id}')
+            slot = self.model.NewIntVar(0, total_slots - 1, f's{module_id}')
+            lieu = self.model.NewIntVar(0, len(self.lieux) - 1, f'l{module_id}')
+            prof = self.model.NewIntVar(0, len(self.professeurs) - 1, f'p{module_id}')
             
             self.exam_vars[module_id] = {
-                'jour': jour_var,
-                'creneau': creneau_var,
-                'lieu': lieu_var,
-                'prof': prof_var,
+                'slot': slot,
+                'lieu': lieu,
+                'prof': prof,
                 'module': module
             }
         
-        print(f"✓ {len(self.exam_vars)} variables")
+        print(f"✓ {len(self.exam_vars)} vars")
     
     def add_constraints(self):
-        print("\n⚙️  Contraintes...")
+        print("⚙️  Contraintes...")
         
-        self._add_capacity_constraints()
-        self._add_student_constraints()
-        self._add_room_constraints()
-        self._add_prof_constraints()
-        self._add_prof_max_per_day()
+        self._constraint_capacity()
+        self._constraint_students()
+        self._constraint_rooms()
+        self._constraint_profs()
         
-        print("✓ Contraintes OK")
+        print("✓ OK")
     
-    def _add_capacity_constraints(self):
-        print("   → Capacité salles")
-        
-        for module_id, vars_dict in self.exam_vars.items():
-            nb_etudiants = self.etudiants_par_module.get(module_id, 0)
-            
-            lieux_valides = []
-            for idx, lieu in self.lieux.iterrows():
-                if lieu['capacite_examen'] >= nb_etudiants:
-                    lieux_valides.append(idx)
-            
-            if lieux_valides:
-                self.model.AddAllowedAssignments([vars_dict['lieu']], [[idx] for idx in lieux_valides])
+    def _constraint_capacity(self):
+        for module_id, v in self.exam_vars.items():
+            nb = self.etudiants_par_module.get(module_id, 0)
+            valid = [i for i, l in self.lieux.iterrows() if l['capacite_examen'] >= nb]
+            if valid:
+                self.model.AddAllowedAssignments([v['lieu']], [[i] for i in valid])
     
-    def _add_student_constraints(self):
-        print("   → Conflits étudiants (1 exam/jour)")
-        
-        etudiants_modules = self.inscriptions.groupby('etudiant_id')['module_id'].apply(list).to_dict()
+    def _constraint_students(self):
+        etud_mods = self.inscriptions.groupby('etudiant_id')['module_id'].apply(list).to_dict()
         
         count = 0
-        for etudiant_id, module_ids in etudiants_modules.items():
-            if len(module_ids) > 1:
-                for i in range(len(module_ids)):
-                    for j in range(i + 1, len(module_ids)):
-                        m_i = module_ids[i]
-                        m_j = module_ids[j]
+        for mods in etud_mods.values():
+            if len(mods) < 2:
+                continue
+            for i in range(len(mods)):
+                for j in range(i + 1, len(mods)):
+                    m1, m2 = mods[i], mods[j]
+                    if m1 in self.exam_vars and m2 in self.exam_vars:
+                        s1 = self.exam_vars[m1]['slot']
+                        s2 = self.exam_vars[m2]['slot']
                         
-                        if m_i in self.exam_vars and m_j in self.exam_vars:
-                            self.model.Add(self.exam_vars[m_i]['jour'] != self.exam_vars[m_j]['jour'])
-                            count += 1
+                        d1 = self.model.NewIntVar(0, self.nb_jours - 1, f'd1_{count}')
+                        d2 = self.model.NewIntVar(0, self.nb_jours - 1, f'd2_{count}')
+                        
+                        self.model.AddDivisionEquality(d1, s1, len(self.creneaux))
+                        self.model.AddDivisionEquality(d2, s2, len(self.creneaux))
+                        self.model.Add(d1 != d2)
+                        count += 1
         
-        print(f"   ✓ {count} contraintes")
+        print(f"   ✓ {count} étudiants")
     
-    def _add_room_constraints(self):
-        print("   → Salles uniques/créneau")
-        
-        module_list = list(self.exam_vars.keys())
+    def _constraint_rooms(self):
+        mods = list(self.exam_vars.keys())
         count = 0
         
-        for i in range(len(module_list)):
-            for j in range(i + 1, min(i + 30, len(module_list))):
-                m_i = module_list[i]
-                m_j = module_list[j]
+        for i in range(len(mods)):
+            for j in range(i + 1, min(i + 25, len(mods))):
+                v1 = self.exam_vars[mods[i]]
+                v2 = self.exam_vars[mods[j]]
                 
-                v_i = self.exam_vars[m_i]
-                v_j = self.exam_vars[m_j]
+                same_lieu = self.model.NewBoolVar(f'rl{i}{j}')
+                self.model.Add(v1['lieu'] == v2['lieu']).OnlyEnforceIf(same_lieu)
+                self.model.Add(v1['lieu'] != v2['lieu']).OnlyEnforceIf(same_lieu.Not())
                 
-                b_same_lieu = self.model.NewBoolVar(f'sl_{i}_{j}')
-                self.model.Add(v_i['lieu'] == v_j['lieu']).OnlyEnforceIf(b_same_lieu)
-                self.model.Add(v_i['lieu'] != v_j['lieu']).OnlyEnforceIf(b_same_lieu.Not())
-                
-                b_same_jour = self.model.NewBoolVar(f'sj_{i}_{j}')
-                self.model.Add(v_i['jour'] == v_j['jour']).OnlyEnforceIf(b_same_jour)
-                self.model.Add(v_i['jour'] != v_j['jour']).OnlyEnforceIf(b_same_jour.Not())
-                
-                b_same_creneau = self.model.NewBoolVar(f'sc_{i}_{j}')
-                self.model.Add(v_i['creneau'] == v_j['creneau']).OnlyEnforceIf(b_same_creneau)
-                self.model.Add(v_i['creneau'] != v_j['creneau']).OnlyEnforceIf(b_same_creneau.Not())
-                
-                self.model.AddBoolOr([b_same_lieu.Not(), b_same_jour.Not(), b_same_creneau.Not()])
+                self.model.Add(v1['slot'] != v2['slot']).OnlyEnforceIf(same_lieu)
                 count += 1
         
-        print(f"   ✓ {count} contraintes")
+        print(f"   ✓ {count} salles")
     
-    def _add_prof_constraints(self):
-        print("   → Profs uniques/créneau")
-        
-        module_list = list(self.exam_vars.keys())
+    def _constraint_profs(self):
+        mods = list(self.exam_vars.keys())
         count = 0
         
-        for i in range(len(module_list)):
-            for j in range(i + 1, min(i + 30, len(module_list))):
-                m_i = module_list[i]
-                m_j = module_list[j]
+        for i in range(len(mods)):
+            for j in range(i + 1, min(i + 25, len(mods))):
+                v1 = self.exam_vars[mods[i]]
+                v2 = self.exam_vars[mods[j]]
                 
-                v_i = self.exam_vars[m_i]
-                v_j = self.exam_vars[m_j]
+                same_prof = self.model.NewBoolVar(f'rp{i}{j}')
+                self.model.Add(v1['prof'] == v2['prof']).OnlyEnforceIf(same_prof)
+                self.model.Add(v1['prof'] != v2['prof']).OnlyEnforceIf(same_prof.Not())
                 
-                b_same_prof = self.model.NewBoolVar(f'sp_{i}_{j}')
-                self.model.Add(v_i['prof'] == v_j['prof']).OnlyEnforceIf(b_same_prof)
-                self.model.Add(v_i['prof'] != v_j['prof']).OnlyEnforceIf(b_same_prof.Not())
-                
-                b_same_jour = self.model.NewBoolVar(f'spj_{i}_{j}')
-                self.model.Add(v_i['jour'] == v_j['jour']).OnlyEnforceIf(b_same_jour)
-                self.model.Add(v_i['jour'] != v_j['jour']).OnlyEnforceIf(b_same_jour.Not())
-                
-                b_same_creneau = self.model.NewBoolVar(f'spc_{i}_{j}')
-                self.model.Add(v_i['creneau'] == v_j['creneau']).OnlyEnforceIf(b_same_creneau)
-                self.model.Add(v_i['creneau'] != v_j['creneau']).OnlyEnforceIf(b_same_creneau.Not())
-                
-                self.model.AddBoolOr([b_same_prof.Not(), b_same_jour.Not(), b_same_creneau.Not()])
+                self.model.Add(v1['slot'] != v2['slot']).OnlyEnforceIf(same_prof)
                 count += 1
         
-        print(f"   ✓ {count} contraintes")
-    
-    def _add_prof_max_per_day(self):
-        print("   → Max 3 exams/prof/jour")
-        
-        for prof_idx in range(len(self.professeurs)):
-            for jour in range(self.nb_jours):
-                prof_day_exams = []
-                
-                for module_id, vars_dict in self.exam_vars.items():
-                    b_prof = self.model.NewBoolVar(f'bp_{prof_idx}_{jour}_{module_id}')
-                    self.model.Add(vars_dict['prof'] == prof_idx).OnlyEnforceIf(b_prof)
-                    self.model.Add(vars_dict['prof'] != prof_idx).OnlyEnforceIf(b_prof.Not())
-                    
-                    b_jour = self.model.NewBoolVar(f'bj_{prof_idx}_{jour}_{module_id}')
-                    self.model.Add(vars_dict['jour'] == jour).OnlyEnforceIf(b_jour)
-                    self.model.Add(vars_dict['jour'] != jour).OnlyEnforceIf(b_jour.Not())
-                    
-                    b_both = self.model.NewBoolVar(f'bb_{prof_idx}_{jour}_{module_id}')
-                    self.model.AddBoolAnd([b_prof, b_jour]).OnlyEnforceIf(b_both)
-                    self.model.AddBoolOr([b_prof.Not(), b_jour.Not()]).OnlyEnforceIf(b_both.Not())
-                    
-                    prof_day_exams.append(b_both)
-                
-                self.model.Add(sum(prof_day_exams) <= 3)
-        
-        print(f"   ✓ Contrainte ajoutée")
+        print(f"   ✓ {count} profs")
     
     def set_objective(self):
-        print("\n🎯 Objectif...")
+        print("🎯 Objectif...")
         
-        objective_terms = []
+        obj = []
         
-        for module_id, vars_dict in self.exam_vars.items():
-            objective_terms.append(-vars_dict['jour'] * 10)
-            objective_terms.append(-vars_dict['creneau'])
+        for module_id, v in self.exam_vars.items():
+            obj.append(-v['slot'])
+            
+            dept = self.module_dept.get(module_id)
+            if dept:
+                for idx, prof in self.professeurs.iterrows():
+                    if prof['dept_id'] == dept:
+                        b = self.model.NewBoolVar(f'o{module_id}{idx}')
+                        self.model.Add(v['prof'] == idx).OnlyEnforceIf(b)
+                        obj.append(b * 50)
         
-        for module_id, vars_dict in self.exam_vars.items():
-            module_dept = self.module_dept.get(module_id)
-            if module_dept:
-                for prof_idx, prof in self.professeurs.iterrows():
-                    if prof['dept_id'] == module_dept:
-                        b = self.model.NewBoolVar(f'd_{module_id}_{prof_idx}')
-                        self.model.Add(vars_dict['prof'] == prof_idx).OnlyEnforceIf(b)
-                        objective_terms.append(b * 20)
-        
-        for module_id, vars_dict in self.exam_vars.items():
-            nb_etudiants = self.etudiants_par_module.get(module_id, 0)
-            if nb_etudiants > 50:
-                for idx, lieu in self.lieux.iterrows():
-                    if lieu['type'] == 'amphi':
-                        b = self.model.NewBoolVar(f'a_{module_id}_{idx}')
-                        self.model.Add(vars_dict['lieu'] == idx).OnlyEnforceIf(b)
-                        objective_terms.append(b * 5)
-        
-        self.model.Maximize(sum(objective_terms))
+        self.model.Maximize(sum(obj))
         print("✓ OK")
     
     def solve(self):
-        print("\n🚀 OPTIMISATION...")
-        print(f"   MAX: 35 secondes")
+        print("\n🚀 RÉSOLUTION (max 30s)...")
         
         start = time_module.time()
         status = self.solver.Solve(self.model)
         elapsed = time_module.time() - start
         
-        print(f"\n⏱️  {elapsed:.2f}s")
+        print(f"⏱️  {elapsed:.1f}s")
         
         if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-            print("✅ SUCCÈS!")
+            print("✅ SUCCÈS")
             return True, elapsed
-        else:
-            print(f"❌ ÉCHEC: {self.solver.StatusName(status)}")
-            return False, elapsed
+        
+        print(f"❌ {self.solver.StatusName(status)}")
+        return False, elapsed
     
     def extract_solution(self):
-        print("\n💾 Sauvegarde...")
+        print("💾 Sauvegarde...")
         
-        examens = []
+        exams = []
         
-        for module_id, vars_dict in self.exam_vars.items():
-            jour_idx = self.solver.Value(vars_dict['jour'])
-            creneau_idx = self.solver.Value(vars_dict['creneau'])
-            lieu_idx = self.solver.Value(vars_dict['lieu'])
-            prof_idx = self.solver.Value(vars_dict['prof'])
+        for module_id, v in self.exam_vars.items():
+            slot_val = self.solver.Value(v['slot'])
+            jour = slot_val // len(self.creneaux)
+            creneau = slot_val % len(self.creneaux)
             
-            date_examen = self.date_debut + timedelta(days=jour_idx)
-            heure_debut = self.creneaux[creneau_idx]
+            date_exam = self.date_debut + timedelta(days=jour)
+            heure = self.creneaux[creneau]
             
-            examens.append({
+            exams.append({
                 'module_id': int(module_id),
                 'session_id': self.session_id,
-                'date_examen': date_examen,
-                'heure_debut': heure_debut,
+                'date_examen': date_exam,
+                'heure_debut': heure,
                 'duree_minutes': 90,
-                'lieu_id': int(self.lieux.iloc[lieu_idx]['id']),
-                'prof_surveillant_id': int(self.professeurs.iloc[prof_idx]['id']),
+                'lieu_id': int(self.lieux.iloc[self.solver.Value(v['lieu'])]['id']),
+                'prof_surveillant_id': int(self.professeurs.iloc[self.solver.Value(v['prof'])]['id']),
                 'nb_inscrits': int(self.etudiants_par_module.get(module_id, 0)),
                 'statut': 'planifie'
             })
         
         db.execute_query("DELETE FROM examens WHERE session_id = %s", (self.session_id,), fetch=False)
         
-        for examen in examens:
+        for exam in exams:
             db.execute_query("""
                 INSERT INTO examens 
                 (module_id, session_id, date_examen, heure_debut, duree_minutes, 
@@ -330,47 +250,43 @@ class ExamScheduleOptimizer:
                 VALUES (%(module_id)s, %(session_id)s, %(date_examen)s, %(heure_debut)s, 
                         %(duree_minutes)s, %(lieu_id)s, %(prof_surveillant_id)s, 
                         %(nb_inscrits)s, %(statut)s)
-            """, examen, fetch=False)
+            """, exam, fetch=False)
         
-        print(f"✅ {len(examens)} examens")
-        return examens
+        print(f"✅ {len(exams)} examens")
+        return exams
     
-    def generate_statistics(self):
-        stats = {
+    def stats(self):
+        return {
             'nb_examens': len(self.exam_vars),
-            'nb_jours_utilises': len(set(self.solver.Value(v['jour']) for v in self.exam_vars.values())),
-            'nb_lieux_utilises': len(set(self.solver.Value(v['lieu']) for v in self.exam_vars.values())),
-            'nb_profs_utilises': len(set(self.solver.Value(v['prof']) for v in self.exam_vars.values()))
+            'nb_jours': len(set(self.solver.Value(v['slot']) // len(self.creneaux) for v in self.exam_vars.values())),
+            'nb_lieux': len(set(self.solver.Value(v['lieu']) for v in self.exam_vars.values())),
+            'nb_profs': len(set(self.solver.Value(v['prof']) for v in self.exam_vars.values()))
         }
-        return stats
 
 def optimize_schedule(session_id, date_debut, nb_jours=15):
-    optimizer = ExamScheduleOptimizer(session_id, date_debut, nb_jours)
+    opt = ExamScheduleOptimizer(session_id, date_debut, nb_jours)
     
     try:
-        optimizer.load_data()
-        
-        if len(optimizer.modules) == 0:
+        opt.load_data()
+        if len(opt.modules) == 0:
             return {'success': False, 'message': 'Aucun module', 'temps': 0}
         
-        optimizer.create_variables()
-        optimizer.add_constraints()
-        optimizer.set_objective()
+        opt.create_variables()
+        opt.add_constraints()
+        opt.set_objective()
         
-        success, temps = optimizer.solve()
-        
+        success, temps = opt.solve()
         if not success:
-            return {'success': False, 'message': 'Aucune solution', 'temps': temps}
+            return {'success': False, 'message': 'Pas de solution', 'temps': temps}
         
-        examens = optimizer.extract_solution()
-        stats = optimizer.generate_statistics()
+        exams = opt.extract_solution()
         
         return {
             'success': True,
             'temps': temps,
-            'nb_examens': len(examens),
-            'stats': stats,
-            'message': f'✅ {temps:.2f}s'
+            'nb_examens': len(exams),
+            'stats': opt.stats(),
+            'message': f'OK en {temps:.1f}s'
         }
         
     except Exception as e:
