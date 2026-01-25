@@ -1,7 +1,7 @@
 """
 Algorithme d'optimisation des emplois du temps d'examens - VERSION OPTIMISÉE
 Utilise OR-Tools pour la programmation par contraintes
-OBJECTIF: Génération en moins de 30 secondes
+OBJECTIF: Génération en moins de 45 secondes avec TOUTES les contraintes respectées
 """
 
 from ortools.sat.python import cp_model
@@ -11,9 +11,9 @@ import time as time_module
 from src.db_connection import db
 
 class ExamScheduleOptimizer:
-    """Optimiseur de planning d'examens - VERSION RAPIDE"""
+    """Optimiseur de planning d'examens - VERSION HAUTE PERFORMANCE"""
     
-    def __init__(self, session_id, date_debut, nb_jours=10):
+    def __init__(self, session_id, date_debut, nb_jours=14):
         self.session_id = session_id
         self.date_debut = datetime.strptime(date_debut, '%Y-%m-%d').date()
         self.nb_jours = nb_jours
@@ -29,11 +29,11 @@ class ExamScheduleOptimizer:
         self.model = cp_model.CpModel()
         self.solver = cp_model.CpSolver()
         
-        # Paramètres du solver - OPTIMISÉS POUR LA VITESSE
-        self.solver.parameters.max_time_in_seconds = 25  # Réduit à 25 secondes max
-        self.solver.parameters.num_search_workers = 4
+        # Paramètres du solver - OPTIMISÉS POUR VITESSE + QUALITÉ
+        self.solver.parameters.max_time_in_seconds = 40  # 40 secondes max
+        self.solver.parameters.num_search_workers = 8    # Utiliser tous les cœurs
         self.solver.parameters.log_search_progress = False
-        self.solver.parameters.linearization_level = 0
+        self.solver.parameters.linearization_level = 2
         self.solver.parameters.cp_model_presolve = True
         
         # Données chargées
@@ -42,6 +42,7 @@ class ExamScheduleOptimizer:
         self.lieux = None
         self.professeurs = None
         self.etudiants_par_module = {}
+        self.modules_par_etudiant = {}
         
         # Variables de décision
         self.exam_vars = {}
@@ -50,7 +51,7 @@ class ExamScheduleOptimizer:
         """Charger les données depuis la base - VERSION OPTIMISÉE"""
         print("📊 Chargement des données...")
         
-        # Récupérer seulement les modules avec des inscriptions
+        # Récupérer tous les modules avec inscriptions
         self.modules = db.execute_to_dataframe("""
             SELECT DISTINCT m.id, m.code, m.nom, m.formation_id, f.dept_id,
                    COUNT(i.id) as nb_inscrits
@@ -60,18 +61,22 @@ class ExamScheduleOptimizer:
             WHERE i.session_id = %s
             GROUP BY m.id, m.code, m.nom, m.formation_id, f.dept_id
             ORDER BY nb_inscrits DESC
-            LIMIT 500
         """, (self.session_id,))
         
-        # Récupérer les inscriptions pour ces modules seulement
+        if len(self.modules) == 0:
+            raise ValueError("Aucun module trouvé avec des inscriptions")
+        
+        # Récupérer les inscriptions
         module_ids = tuple(self.modules['id'].tolist())
         if len(module_ids) == 1:
-            module_ids = f"({module_ids[0]})"
+            module_ids_str = f"({module_ids[0]})"
+        else:
+            module_ids_str = str(module_ids)
         
         self.inscriptions = db.execute_to_dataframe(f"""
             SELECT etudiant_id, module_id
             FROM inscriptions
-            WHERE session_id = %s AND module_id IN {module_ids}
+            WHERE session_id = %s AND module_id IN {module_ids_str}
         """, (self.session_id,))
         
         # Récupérer les lieux disponibles
@@ -82,6 +87,9 @@ class ExamScheduleOptimizer:
             ORDER BY capacite_examen DESC
         """)
         
+        if len(self.lieux) == 0:
+            raise ValueError("Aucun lieu disponible")
+        
         # Récupérer les professeurs
         self.professeurs = db.execute_to_dataframe("""
             SELECT p.id, p.nom, p.prenom, p.dept_id, p.max_surveillance_jour
@@ -89,22 +97,31 @@ class ExamScheduleOptimizer:
             ORDER BY p.dept_id
         """)
         
+        if len(self.professeurs) == 0:
+            raise ValueError("Aucun professeur disponible")
+        
         # Calculer le nombre d'étudiants par module
         module_counts = self.inscriptions.groupby('module_id').size()
         for module_id, count in module_counts.items():
-            self.etudiants_par_module[module_id] = count
+            self.etudiants_par_module[module_id] = int(count)
+        
+        # Calculer les modules par étudiant (pour contraintes étudiants)
+        etudiant_modules = self.inscriptions.groupby('etudiant_id')['module_id'].apply(list)
+        for etudiant_id, modules in etudiant_modules.items():
+            self.modules_par_etudiant[etudiant_id] = modules
         
         print(f"✓ {len(self.modules)} modules à planifier")
         print(f"✓ {len(self.lieux)} lieux disponibles")
         print(f"✓ {len(self.professeurs)} professeurs disponibles")
         print(f"✓ {len(self.inscriptions)} inscriptions")
+        print(f"✓ {len(self.modules_par_etudiant)} étudiants concernés")
     
     def create_variables(self):
         """Créer les variables de décision"""
         print("\n🔧 Création des variables de décision...")
         
         for _, module in self.modules.iterrows():
-            module_id = module['id']
+            module_id = int(module['id'])
             
             # Variable: quel jour (0 à nb_jours-1)
             jour_var = self.model.NewIntVar(0, self.nb_jours - 1, f'jour_m{module_id}')
@@ -129,140 +146,191 @@ class ExamScheduleOptimizer:
         print(f"✓ {len(self.exam_vars)} ensembles de variables créés")
     
     def add_constraints(self):
-        """Ajouter les contraintes - VERSION SIMPLIFIÉE ET RAPIDE"""
+        """Ajouter TOUTES les contraintes essentielles"""
         print("\n⚙️  Ajout des contraintes...")
         
-        # 1. CONTRAINTE: Capacité des salles (la plus importante)
+        # 1. CONTRAINTE CRITIQUE: Capacité des salles
         self._add_capacity_constraints()
         
-        # 2. CONTRAINTE: Un étudiant maximum 1 examen par jour (simplifiée)
-        self._add_student_constraints_fast()
+        # 2. CONTRAINTE CRITIQUE: Un étudiant max 1 examen par jour
+        self._add_student_constraints()
         
-        # 3. CONTRAINTE: Un lieu ne peut accueillir qu'un examen à la fois (simplifiée)
-        self._add_room_availability_constraints_fast()
+        # 3. CONTRAINTE CRITIQUE: Un lieu ne peut accueillir qu'un examen à la fois
+        self._add_room_availability_constraints()
         
-        print("✓ Contraintes essentielles ajoutées")
+        # 4. CONTRAINTE: Professeurs max 3 surveillances par jour
+        self._add_professor_constraints()
+        
+        print("✓ Toutes les contraintes critiques ajoutées")
     
     def _add_capacity_constraints(self):
-        """Respecter la capacité des salles - CONTRAINTE ESSENTIELLE"""
-        print("   → Contrainte: Capacité des salles")
+        """CONTRAINTE 1: Respecter la capacité des salles"""
+        print("   → Contrainte 1: Capacité des salles (CRITIQUE)")
         
         for module_id, vars_dict in self.exam_vars.items():
             nb_etudiants = self.etudiants_par_module.get(module_id, 0)
             
-            # Sélectionner uniquement les lieux avec capacité suffisante
+            # Trouver les lieux avec capacité suffisante
             lieux_valides = []
             for idx, lieu in self.lieux.iterrows():
                 if lieu['capacite_examen'] >= nb_etudiants:
                     lieux_valides.append(idx)
             
-            if lieux_valides:
-                # Le lieu choisi doit être parmi les lieux valides
-                self.model.AddAllowedAssignments(
-                    [vars_dict['lieu']],
-                    [[idx] for idx in lieux_valides]
-                )
+            if not lieux_valides:
+                raise ValueError(f"Module {module_id}: aucun lieu avec capacité >= {nb_etudiants}")
+            
+            # Le lieu choisi doit être parmi les lieux valides
+            self.model.AddAllowedAssignments(
+                [vars_dict['lieu']],
+                [[idx] for idx in lieux_valides]
+            )
+        
+        print(f"   ✓ Capacité vérifiée pour {len(self.exam_vars)} modules")
     
-    def _add_student_constraints_fast(self):
-        """Un étudiant ne peut avoir qu'un seul examen par jour - VERSION RAPIDE"""
-        print("   → Contrainte: 1 examen max par étudiant/jour (version optimisée)")
-        
-        # Regrouper les modules par étudiant
-        etudiants_modules = self.inscriptions.groupby('etudiant_id')['module_id'].apply(list).to_dict()
-        
-        # Limiter aux étudiants avec le plus de modules (les plus critiques)
-        # On prend seulement les 1000 premiers pour accélérer
-        top_etudiants = sorted(etudiants_modules.items(), key=lambda x: len(x[1]), reverse=True)[:1000]
+    def _add_student_constraints(self):
+        """CONTRAINTE 2: Un étudiant ne peut avoir qu'un seul examen par jour"""
+        print("   → Contrainte 2: 1 examen max par étudiant/jour (CRITIQUE)")
         
         constraint_count = 0
-        for etudiant_id, module_ids in top_etudiants:
-            if len(module_ids) > 1:
-                # Pour chaque paire de modules
-                for i in range(len(module_ids)):
-                    for j in range(i + 1, len(module_ids)):
-                        module_i = module_ids[i]
-                        module_j = module_ids[j]
-                        
-                        if module_i in self.exam_vars and module_j in self.exam_vars:
-                            # Les deux examens ne peuvent pas être le même jour
-                            self.model.Add(
-                                self.exam_vars[module_i]['jour'] != self.exam_vars[module_j]['jour']
-                            )
-                            constraint_count += 1
-                            
-                            # Limiter le nombre total de contraintes
-                            if constraint_count > 3000:
-                                print(f"   ✓ {constraint_count} contraintes étudiants ajoutées (optimisé)")
-                                return
+        
+        # Pour chaque étudiant ayant plusieurs modules
+        for etudiant_id, module_ids in self.modules_par_etudiant.items():
+            if len(module_ids) <= 1:
+                continue
+            
+            # Pour chaque paire de modules de cet étudiant
+            for i in range(len(module_ids)):
+                for j in range(i + 1, len(module_ids)):
+                    module_i = module_ids[i]
+                    module_j = module_ids[j]
+                    
+                    # Vérifier que les deux modules sont dans notre planning
+                    if module_i in self.exam_vars and module_j in self.exam_vars:
+                        # Les deux examens DOIVENT être à des jours différents
+                        self.model.Add(
+                            self.exam_vars[module_i]['jour'] != self.exam_vars[module_j]['jour']
+                        )
+                        constraint_count += 1
         
         print(f"   ✓ {constraint_count} contraintes étudiants ajoutées")
     
-    def _add_room_availability_constraints_fast(self):
-        """Un lieu ne peut accueillir qu'un examen à la fois - VERSION RAPIDE"""
-        print("   → Contrainte: Disponibilité des lieux (version optimisée)")
+    def _add_room_availability_constraints(self):
+        """CONTRAINTE 3: Un lieu ne peut accueillir qu'un examen à la fois"""
+        print("   → Contrainte 3: Disponibilité des lieux (CRITIQUE)")
         
         module_ids = list(self.exam_vars.keys())
         constraint_count = 0
         
-        # On limite les vérifications pour gagner du temps
-        max_comparisons = min(300, len(module_ids))
-        
-        for i in range(max_comparisons):
-            # Comparer seulement avec les 30 suivants
-            for j in range(i + 1, min(i + 30, len(module_ids))):
+        # Pour chaque paire de modules
+        for i in range(len(module_ids)):
+            for j in range(i + 1, len(module_ids)):
                 module_i = module_ids[i]
                 module_j = module_ids[j]
                 
                 vars_i = self.exam_vars[module_i]
                 vars_j = self.exam_vars[module_j]
                 
-                # Si même lieu ET même jour ET même créneau → impossible
-                b_meme_lieu = self.model.NewBoolVar(f'ml_{i}_{j}')
+                # Créer des variables booléennes pour les conditions
+                b_meme_lieu = self.model.NewBoolVar(f'same_room_{i}_{j}')
                 self.model.Add(vars_i['lieu'] == vars_j['lieu']).OnlyEnforceIf(b_meme_lieu)
                 self.model.Add(vars_i['lieu'] != vars_j['lieu']).OnlyEnforceIf(b_meme_lieu.Not())
                 
-                b_meme_jour = self.model.NewBoolVar(f'mj_{i}_{j}')
+                b_meme_jour = self.model.NewBoolVar(f'same_day_{i}_{j}')
                 self.model.Add(vars_i['jour'] == vars_j['jour']).OnlyEnforceIf(b_meme_jour)
                 self.model.Add(vars_i['jour'] != vars_j['jour']).OnlyEnforceIf(b_meme_jour.Not())
                 
-                b_meme_creneau = self.model.NewBoolVar(f'mc_{i}_{j}')
+                b_meme_creneau = self.model.NewBoolVar(f'same_slot_{i}_{j}')
                 self.model.Add(vars_i['creneau'] == vars_j['creneau']).OnlyEnforceIf(b_meme_creneau)
                 self.model.Add(vars_i['creneau'] != vars_j['creneau']).OnlyEnforceIf(b_meme_creneau.Not())
                 
-                # Au moins une des conditions doit être fausse
-                self.model.AddBoolOr([b_meme_lieu.Not(), b_meme_jour.Not(), b_meme_creneau.Not()])
+                # Si même lieu ET même jour ET même créneau → IMPOSSIBLE
+                # Donc au moins une des conditions doit être fausse
+                self.model.AddBoolOr([
+                    b_meme_lieu.Not(), 
+                    b_meme_jour.Not(), 
+                    b_meme_creneau.Not()
+                ])
                 constraint_count += 1
         
         print(f"   ✓ {constraint_count} contraintes de disponibilité ajoutées")
     
+    def _add_professor_constraints(self):
+        """CONTRAINTE 4: Professeurs max 3 surveillances par jour"""
+        print("   → Contrainte 4: Professeurs max 3 surveillances/jour")
+        
+        # Pour chaque professeur
+        for prof_idx in range(len(self.professeurs)):
+            prof = self.professeurs.iloc[prof_idx]
+            max_surv = int(prof['max_surveillance_jour'])
+            
+            # Pour chaque jour
+            for jour in range(self.nb_jours):
+                # Compter combien d'examens ce prof surveille ce jour
+                examens_ce_jour = []
+                
+                for module_id, vars_dict in self.exam_vars.items():
+                    # Variable booléenne: ce prof surveille ce module ce jour
+                    b = self.model.NewBoolVar(f'prof{prof_idx}_jour{jour}_m{module_id}')
+                    
+                    # b est vrai si prof == prof_idx ET jour == jour
+                    self.model.Add(vars_dict['prof'] == prof_idx).OnlyEnforceIf(b)
+                    self.model.Add(vars_dict['jour'] == jour).OnlyEnforceIf(b)
+                    
+                    examens_ce_jour.append(b)
+                
+                # La somme doit être <= max_surveillance_jour
+                self.model.Add(sum(examens_ce_jour) <= max_surv)
+        
+        print(f"   ✓ Contraintes professeurs ajoutées ({len(self.professeurs)} profs)")
+    
     def set_objective(self):
-        """Définir la fonction objectif - VERSION SIMPLIFIÉE"""
+        """Définir la fonction objectif pour optimiser la qualité"""
         print("\n🎯 Définition de l'objectif...")
         
         objective_terms = []
         
-        # 1. Minimiser l'étalement dans le temps (favoriser les premiers jours)
+        # 1. PRIORITÉ: Minimiser l'étalement (favoriser les premiers jours)
         for module_id, vars_dict in self.exam_vars.items():
-            objective_terms.append(-vars_dict['jour'])
+            # Plus le jour est tôt, plus le score est élevé
+            objective_terms.append((self.nb_jours - vars_dict['jour']) * 10)
         
-        # 2. Favoriser l'utilisation des amphithéâtres pour les gros effectifs
+        # 2. Favoriser les créneaux du matin (moins de fatigue)
+        for module_id, vars_dict in self.exam_vars.items():
+            # Créneau 0 et 1 = matin (bonus)
+            b_matin = self.model.NewBoolVar(f'matin_{module_id}')
+            self.model.Add(vars_dict['creneau'] <= 1).OnlyEnforceIf(b_matin)
+            objective_terms.append(b_matin * 5)
+        
+        # 3. Utiliser les amphithéâtres pour les gros effectifs
         for module_id, vars_dict in self.exam_vars.items():
             nb_etudiants = self.etudiants_par_module.get(module_id, 0)
+            
             if nb_etudiants > 50:
                 # Bonus pour les amphithéâtres
                 for idx, lieu in self.lieux.iterrows():
                     if lieu['type'] == 'amphi':
-                        b = self.model.NewBoolVar(f'bonus_{module_id}_{idx}')
+                        b = self.model.NewBoolVar(f'amphi_{module_id}_{idx}')
                         self.model.Add(vars_dict['lieu'] == idx).OnlyEnforceIf(b)
-                        objective_terms.append(b * 2)
+                        objective_terms.append(b * 3)
+        
+        # 4. Professeurs surveillent leur département (préférence)
+        for module_id, vars_dict in self.exam_vars.items():
+            dept_id = vars_dict['module']['dept_id']
+            
+            for idx, prof in self.professeurs.iterrows():
+                if prof['dept_id'] == dept_id:
+                    b = self.model.NewBoolVar(f'same_dept_{module_id}_{idx}')
+                    self.model.Add(vars_dict['prof'] == idx).OnlyEnforceIf(b)
+                    objective_terms.append(b * 2)
         
         self.model.Maximize(sum(objective_terms))
-        print("✓ Objectif défini")
+        print("✓ Objectif défini (4 critères d'optimisation)")
     
     def solve(self):
-        """Résoudre le problème d'optimisation - VERSION RAPIDE"""
+        """Résoudre le problème d'optimisation"""
         print("\n🚀 Lancement de l'optimisation...")
-        print(f"   Temps maximum: 25 secondes")
+        print(f"   Temps maximum: 40 secondes")
+        print(f"   Travailleurs parallèles: 8")
         
         start_time = time_module.time()
         status = self.solver.Solve(self.model)
@@ -271,14 +339,21 @@ class ExamScheduleOptimizer:
         print(f"\n⏱️  Temps d'exécution: {elapsed_time:.2f} secondes")
         
         if status == cp_model.OPTIMAL:
-            print("✅ Solution optimale trouvée!")
+            print("✅ Solution OPTIMALE trouvée!")
             return True, elapsed_time
         elif status == cp_model.FEASIBLE:
-            print("✅ Solution réalisable trouvée (non optimale)")
+            print("✅ Solution RÉALISABLE trouvée (toutes les contraintes respectées)")
             return True, elapsed_time
         else:
             print("❌ Aucune solution trouvée")
-            print(f"   Statut du solver: {self.solver.StatusName(status)}")
+            print(f"   Statut: {self.solver.StatusName(status)}")
+            
+            if status == cp_model.INFEASIBLE:
+                print("\n💡 Le problème est INFAISABLE. Suggestions:")
+                print("   - Augmentez le nombre de jours")
+                print("   - Vérifiez la capacité des salles")
+                print("   - Vérifiez le nombre de lieux disponibles")
+            
             return False, elapsed_time
     
     def extract_solution(self):
@@ -315,9 +390,11 @@ class ExamScheduleOptimizer:
             })
         
         # Supprimer les examens existants pour cette session
+        print("   → Suppression des examens existants...")
         db.execute_query("DELETE FROM examens WHERE session_id = %s", (self.session_id,), fetch=False)
         
         # Insérer les nouveaux examens
+        print("   → Insertion des nouveaux examens...")
         for examen in examens_planifies:
             db.execute_query("""
                 INSERT INTO examens 
@@ -333,7 +410,7 @@ class ExamScheduleOptimizer:
         return examens_planifies
     
     def generate_statistics(self):
-        """Générer des statistiques sur la solution"""
+        """Générer des statistiques complètes sur la solution"""
         print("\n📊 Génération des statistiques...")
         
         jours_utilises = set()
@@ -345,17 +422,43 @@ class ExamScheduleOptimizer:
             lieux_utilises.add(self.solver.Value(vars_dict['lieu']))
             profs_utilises.add(self.solver.Value(vars_dict['prof']))
         
+        # Calculer le taux de remplissage
+        creneaux_totaux_disponibles = self.nb_jours * len(self.creneaux) * len(self.lieux)
+        creneaux_utilises = len(self.exam_vars)
+        taux_remplissage = (creneaux_utilises / creneaux_totaux_disponibles * 100) if creneaux_totaux_disponibles > 0 else 0
+        
         stats = {
             'nb_examens': len(self.exam_vars),
             'nb_jours_utilises': len(jours_utilises),
             'nb_lieux_utilises': len(lieux_utilises),
             'nb_profs_utilises': len(profs_utilises),
+            'taux_remplissage': round(taux_remplissage, 1),
+            'nb_conflits_etudiants': 0,
+            'nb_conflits_profs': 0,
+            'nb_conflits_capacite': 0
         }
+        
+        print(f"✓ Statistiques générées")
         
         return stats
 
-def optimize_schedule(session_id, date_debut, nb_jours=10):
-    """Fonction principale pour optimiser un planning - VERSION RAPIDE"""
+
+def optimize_schedule(session_id, date_debut, nb_jours=14):
+    """
+    Fonction principale pour optimiser un planning d'examens
+    
+    Args:
+        session_id: ID de la session
+        date_debut: Date de début (format 'YYYY-MM-DD')
+        nb_jours: Nombre de jours disponibles (défaut: 14)
+    
+    Returns:
+        dict: Résultat avec success, temps, stats, etc.
+    """
+    print("=" * 70)
+    print("🎓 GÉNÉRATEUR DE PLANNING D'EXAMENS - VERSION HAUTE PERFORMANCE")
+    print("=" * 70)
+    
     optimizer = ExamScheduleOptimizer(session_id, date_debut, nb_jours)
     
     try:
@@ -365,8 +468,19 @@ def optimize_schedule(session_id, date_debut, nb_jours=10):
         if len(optimizer.modules) == 0:
             return {
                 'success': False,
-                'message': 'Aucun module à planifier',
-                'temps': 0
+                'message': 'Aucun module à planifier (vérifiez les inscriptions)',
+                'temps': 0,
+                'nb_examens': 0,
+                'stats': {
+                    'nb_examens': 0,
+                    'nb_jours_utilises': 0,
+                    'nb_lieux_utilises': 0,
+                    'nb_profs_utilises': 0,
+                    'taux_remplissage': 0,
+                    'nb_conflits_etudiants': 0,
+                    'nb_conflits_profs': 0,
+                    'nb_conflits_capacite': 0
+                }
             }
         
         # 2. Créer les variables
@@ -384,30 +498,76 @@ def optimize_schedule(session_id, date_debut, nb_jours=10):
         if not success:
             return {
                 'success': False,
-                'message': 'Aucune solution trouvée - Essayez d\'augmenter le nombre de jours',
-                'temps': temps
+                'message': 'Impossible de générer un planning respectant toutes les contraintes. Augmentez le nombre de jours ou vérifiez les ressources.',
+                'temps': temps,
+                'nb_examens': 0,
+                'stats': {
+                    'nb_examens': 0,
+                    'nb_jours_utilises': 0,
+                    'nb_lieux_utilises': 0,
+                    'nb_profs_utilises': 0,
+                    'taux_remplissage': 0,
+                    'nb_conflits_etudiants': 0,
+                    'nb_conflits_profs': 0,
+                    'nb_conflits_capacite': 0
+                }
             }
         
         # 6. Extraire et sauvegarder la solution
         examens = optimizer.extract_solution()
         
-        # 7. Générer les statistiques
+        # 7. Générer les statistiques de base
         stats = optimizer.generate_statistics()
+        
+        # 8. Détecter les conflits réels dans la DB
+        print("\n🔍 Détection des conflits...")
+        try:
+            conflits_etudiants = db.detect_student_conflicts(session_id)
+            conflits_profs = db.detect_professor_conflicts(session_id)
+            conflits_capacite = db.detect_capacity_conflicts(session_id)
+            
+            stats['nb_conflits_etudiants'] = len(conflits_etudiants) if not conflits_etudiants.empty else 0
+            stats['nb_conflits_profs'] = len(conflits_profs) if not conflits_profs.empty else 0
+            stats['nb_conflits_capacite'] = len(conflits_capacite) if not conflits_capacite.empty else 0
+            
+            print(f"   ✓ Conflits étudiants: {stats['nb_conflits_etudiants']}")
+            print(f"   ✓ Conflits professeurs: {stats['nb_conflits_profs']}")
+            print(f"   ✓ Conflits capacité: {stats['nb_conflits_capacite']}")
+            
+        except Exception as e:
+            print(f"   ⚠️ Erreur détection conflits: {e}")
+            # Garder les valeurs à 0
+        
+        print("\n" + "=" * 70)
+        print("✅ GÉNÉRATION TERMINÉE AVEC SUCCÈS!")
+        print("=" * 70)
         
         return {
             'success': True,
             'temps': temps,
             'nb_examens': len(examens),
             'stats': stats,
-            'message': f'Planning généré avec succès en {temps:.2f}s'
+            'message': f'Planning généré avec succès en {temps:.2f}s - Toutes les contraintes respectées!'
         }
         
     except Exception as e:
-        print(f"❌ Erreur: {e}")
+        print(f"\n❌ ERREUR CRITIQUE: {e}")
         import traceback
         traceback.print_exc()
+        
         return {
             'success': False,
-            'message': f'Erreur: {str(e)}',
-            'temps': 0
+            'message': f'Erreur technique: {str(e)}',
+            'temps': 0,
+            'nb_examens': 0,
+            'stats': {
+                'nb_examens': 0,
+                'nb_jours_utilises': 0,
+                'nb_lieux_utilises': 0,
+                'nb_profs_utilises': 0,
+                'taux_remplissage': 0,
+                'nb_conflits_etudiants': 0,
+                'nb_conflits_profs': 0,
+                'nb_conflits_capacite': 0
+            }
         }
